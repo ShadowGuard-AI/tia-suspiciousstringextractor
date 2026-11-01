@@ -44,6 +44,11 @@ def extract_strings_from_file(file_path):
     """
     results = {}
     try:
+        # The read is strict UTF-8. A binary file, which is exactly
+        # the kind of file these patterns are meant for, raises on
+        # decode, lands in the generic handler below, and returns None,
+        # and main then prints nothing at all, not even the no strings
+        # message an empty result gets.
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()
         for pattern_name, pattern in PATTERNS.items():
@@ -82,6 +87,11 @@ def extract_strings_from_pcap(pcap_path):
                 if ip_packet is not None:
                    payload = ip_packet.child()
                    if payload is not None:
+                       # Each payload is decoded and scanned on its
+                       # own. A string split across two packets is
+                       # never reassembled, so it cannot match, and one
+                       # bad packet further down returns None for the
+                       # whole capture, discarding matches already found.
                        payload_data = payload.get_bytes()
                        text = payload_data.decode("utf-8", errors="ignore")
 
@@ -128,6 +138,10 @@ def extract_strings_from_url(url):
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        # get_text drops the markup, so URLs that live in href and
+        # src attributes are gone before the scan. The suspicious_url
+        # pattern, which looks for download links, is mostly scanning
+        # visible page text where those links rarely appear in full.
         soup = BeautifulSoup(response.content, "html.parser")
         text = soup.get_text()
 
