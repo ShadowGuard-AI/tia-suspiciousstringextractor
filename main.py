@@ -2,11 +2,9 @@ import argparse
 import logging
 import re
 import os
+import sys
 import requests
-import pcapy
-from impacket import ImpactDecoder
 from urllib.parse import urlparse
-from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -16,7 +14,7 @@ PATTERNS = {
     "bitcoin_address": r"[13][a-km-zA-HJ-NP-Z1-9]{25,34}",
     "ethereum_address": r"0x[a-fA-F0-9]{40}",
     "zeus_config": r"Zeus.*Config", # Example, needs to be refined
-    "suspicious_url": r"https?://.*(exe|dll|scr)",
+    "suspicious_url": r"https?://.*(?:exe|dll|scr)",
     "ip_address": r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" #Basic IP check, refine
 }
 
@@ -44,17 +42,18 @@ def extract_strings_from_file(file_path):
     """
     results = {}
     try:
-        # The read is strict UTF-8. A binary file, which is exactly
-        # the kind of file these patterns are meant for, raises on
-        # decode, lands in the generic handler below, and returns None,
-        # and main then prints nothing at all, not even the no strings
-        # message an empty result gets.
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()
         for pattern_name, pattern in PATTERNS.items():
-            matches = re.findall(pattern, text)
-            if matches:
-                results[pattern_name] = matches
+            entries = []
+            for match in re.finditer(pattern, text):
+                line_number = text.count("\n", 0, match.start()) + 1
+                entries.append({
+                    "value": match.group(0),
+                    "location": f"{file_path}: line {line_number}, offset {match.start()}",
+                })
+            if entries:
+                results[pattern_name] = entries
     except FileNotFoundError:
         logging.error(f"File not found: {file_path}")
         return None
@@ -73,7 +72,14 @@ def extract_strings_from_pcap(pcap_path):
     Returns:
         dict: A dictionary where keys are the pattern names and values are lists of found strings.
     """
+    try:
+        import pcapy
+        from impacket import ImpactDecoder
+    except ImportError as e:
+        logging.error(f"PCAP scanning requires the pcapy and impacket packages, which are not installed: {e}")
+        return None
     results = {}
+    packet_number = 0
     try:
         # Initialize the PCAP reader
         reader = pcapy.open_offline(pcap_path)
@@ -82,25 +88,24 @@ def extract_strings_from_pcap(pcap_path):
         while True:
             try:
                 header, data = reader.next()
+                packet_number += 1
                 ethernet = decoder.decode(data)
                 ip_packet = ethernet.child()
                 if ip_packet is not None:
                    payload = ip_packet.child()
                    if payload is not None:
-                       # Each payload is decoded and scanned on its
-                       # own. A string split across two packets is
-                       # never reassembled, so it cannot match, and one
-                       # bad packet further down returns None for the
-                       # whole capture, discarding matches already found.
                        payload_data = payload.get_bytes()
                        text = payload_data.decode("utf-8", errors="ignore")
 
                        for pattern_name, pattern in PATTERNS.items():
-                           matches = re.findall(pattern, text)
-                           if matches:
+                           entries = [{
+                               "value": match.group(0),
+                               "location": f"{pcap_path}: packet {packet_number}, offset {match.start()}",
+                           } for match in re.finditer(pattern, text)]
+                           if entries:
                                if pattern_name not in results:
                                    results[pattern_name] = []
-                               results[pattern_name].extend(matches)
+                               results[pattern_name].extend(entries)
             except pcapy.PcapError as e:
                 if "No more packets" in str(e):
                     break  # End of PCAP file
@@ -112,8 +117,15 @@ def extract_strings_from_pcap(pcap_path):
                 return None
 
         # Remove duplicates
-        for pattern_name, matches in results.items():
-            results[pattern_name] = list(set(matches))
+        for pattern_name, entries in results.items():
+            seen = set()
+            unique_entries = []
+            for entry in entries:
+                key = (entry["value"], entry["location"])
+                if key not in seen:
+                    seen.add(key)
+                    unique_entries.append(entry)
+            results[pattern_name] = unique_entries
 
     except FileNotFoundError:
         logging.error(f"PCAP file not found: {pcap_path}")
@@ -134,21 +146,28 @@ def extract_strings_from_url(url):
     Returns:
         dict: A dictionary where keys are the pattern names and values are lists of found strings.
     """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as e:
+        logging.error(f"URL scanning requires the beautifulsoup4 package, which is not installed: {e}")
+        return None
     results = {}
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-        # get_text drops the markup, so URLs that live in href and
-        # src attributes are gone before the scan. The suspicious_url
-        # pattern, which looks for download links, is mostly scanning
-        # visible page text where those links rarely appear in full.
         soup = BeautifulSoup(response.content, "html.parser")
         text = soup.get_text()
 
         for pattern_name, pattern in PATTERNS.items():
-            matches = re.findall(pattern, text)
-            if matches:
-                results[pattern_name] = matches
+            entries = []
+            for match in re.finditer(pattern, text):
+                line_number = text.count("\n", 0, match.start()) + 1
+                entries.append({
+                    "value": match.group(0),
+                    "location": f"{url}: line {line_number}, offset {match.start()}",
+                })
+            if entries:
+                results[pattern_name] = entries
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching URL {url}: {e}")
@@ -168,13 +187,16 @@ def write_results(results, output_file):
     """
     if not results:
         print("No suspicious strings found.")
-        return
+        return True
 
     output_string = ""
     for pattern_name, matches in results.items():
         output_string += f"--- {pattern_name} ---\n"
         for match in matches:
-            output_string += f"{match}\n"
+            if isinstance(match, dict):
+                output_string += f"{match['value']} ({match['location']})\n"
+            else:
+                output_string += f"{match}\n"
         output_string += "\n"
 
     if output_file:
@@ -182,10 +204,13 @@ def write_results(results, output_file):
             with open(output_file, "w", encoding="utf-8") as f:
                 f.write(output_string)
             logging.info(f"Results written to {output_file}")
+            return True
         except Exception as e:
             logging.error(f"Error writing to file {output_file}: {e}")
+            return False
     else:
         print(output_string)
+        return True
 
 def main():
     """
@@ -203,8 +228,12 @@ def main():
     elif args.url:
         results = extract_strings_from_url(args.url)
 
-    if results is not None:
-       write_results(results, args.output)
+    if results is None:
+        logging.error("The scan failed and produced no results.")
+        sys.exit(1)
+
+    if not write_results(results, args.output):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
